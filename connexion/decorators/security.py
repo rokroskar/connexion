@@ -25,9 +25,21 @@ def get_tokeninfo_url(security_definition):
     >>> get_tokeninfo_url({'x-tokenInfoUrl': 'foo'})
     'foo'
     '''
-    token_info_url = (security_definition.get('x-tokenInfoUrl') or
-                      os.environ.get('TOKENINFO_URL'))
+    token_info_url = (security_definition.get('x-tokenInfoUrl')
+                      or os.environ.get('TOKENINFO_URL'))
     return token_info_url
+
+
+def get_client_credentials(security_definition):
+    """
+    Get client credentials from security definition
+
+    :type security_definition: dict
+    :rtype: dict
+    """
+    client_id = (security_definition.get('x-clientId') or None)
+    client_secret = (security_definition.get('x-clientSecret') or None)
+    return {'client_id': client_id, 'client_secret': client_secret}
 
 
 def security_passthrough(function):
@@ -38,7 +50,7 @@ def security_passthrough(function):
     return function
 
 
-def verify_oauth(token_info_url, allowed_scopes, function):
+def verify_oauth(token_info_url, allowed_scopes, client_credentials, function):
     """
     Decorator to verify oauth
 
@@ -46,6 +58,7 @@ def verify_oauth(token_info_url, allowed_scopes, function):
     :type token_info_url: str
     :param allowed_scopes: Set with scopes that are allowed to access the endpoint
     :type allowed_scopes: set
+    :type client_credentials: dict
     :type function: types.FunctionType
     :rtype: types.FunctionType
     """
@@ -63,30 +76,46 @@ def verify_oauth(token_info_url, allowed_scopes, function):
             except ValueError:
                 raise OAuthProblem(description='Invalid authorization header')
             logger.debug("... Getting token from %s", token_info_url)
-            token_request = session.get(token_info_url, params={'access_token': token}, timeout=5)
-            logger.debug("... Token info (%d): %s", token_request.status_code, token_request.text)
+
+            if all(client_credentials.values()):
+                method = 'POST'
+                auth = (client_credentials['client_id'],
+                        client_credentials['client_secret'])
+                data = {'token': token}
+                params = None
+            else:
+                method = 'GET'
+                params = {'access_token': token}
+
+            token_request = session.request(
+                method, token_info_url, auth=auth, data=data, params=params)
+
+            logger.debug("... Token info (%d): %s", token_request.status_code,
+                         token_request.text)
             if not token_request.ok:
                 raise OAuthResponseProblem(
                     description='Provided oauth token is not valid',
-                    token_response=token_request
-                )
+                    token_response=token_request)
             token_info = token_request.json()  # type: dict
-            if isinstance(token_info['scope'], list):
-                user_scopes = set(token_info['scope'])
+
+            # TODO: keycloak doesn't seem to return scopes, so we check roles
+            if isinstance(token_info['realm_access']['roles'], list):
+                user_scopes = set(token_info['realm_access']['roles'])
             else:
-                user_scopes = set(token_info['scope'].split())
+                user_scopes = set(token_info['realm_access']['roles'].split())
             logger.debug("... Scopes required: %s", allowed_scopes)
             logger.debug("... User scopes: %s", user_scopes)
             if not allowed_scopes <= user_scopes:
-                logger.info(textwrap.dedent("""
+                logger.info(
+                    textwrap.dedent("""
                             ... User scopes (%s) do not match the scopes necessary to call endpoint (%s).
                              Aborting with 403.""").replace('\n', ''),
-                            user_scopes, allowed_scopes)
+                    user_scopes, allowed_scopes)
                 raise OAuthScopeProblem(
-                    description='Provided token doesn\'t have the required scope',
+                    description=
+                    'Provided token doesn\'t have the required scope',
                     required_scopes=allowed_scopes,
-                    token_scopes=user_scopes
-                )
+                    token_scopes=user_scopes)
             logger.info("... Token authenticated.")
             request.context['user'] = token_info.get('uid')
             request.context['token_info'] = token_info
